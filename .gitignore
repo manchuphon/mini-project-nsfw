@@ -1,0 +1,16 @@
+model/
+*.onnx
+*.onnx
+
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+env/
+
+coverage.xml
+.pytest_cache/
+
+.DS_Store
+Thumbs.db

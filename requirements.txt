@@ -1,0 +1,9 @@
+torch
+transformers
+onnx
+onnxruntime
+pillow
+numpy
+fastapi
+uvicorn 
+python-multipart
