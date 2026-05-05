@@ -1,9 +1,11 @@
 torch
+torchvision
 transformers
 onnx
+onnxscript
 onnxruntime
 pillow
 numpy
 fastapi
-uvicorn 
+uvicorn
 python-multipart
