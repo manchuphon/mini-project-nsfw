@@ -1,5 +1,5 @@
+# Model files — ignored in git, built during Docker build
 model/
-*.onnx
 *.onnx
 
 __pycache__/
