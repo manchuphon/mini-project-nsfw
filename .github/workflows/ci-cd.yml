@@ -1,0 +1,178 @@
+name: CI / CD – NSFW Image Classification API
+
+on:
+  push:
+    branches: ["**"]          # run on every branch push
+  pull_request:
+    branches: [main, master]
+
+# ============================================================
+# Shared env vars
+# ============================================================
+env:
+  PYTHON_VERSION: "3.11"
+  MODEL_BACKEND: "quantized"
+  MODEL_DIR: "./model"
+  HF_SPACE: ${{ secrets.HF_SPACE_NAME }}   # e.g.  username/space-name
+
+jobs:
+  # ----------------------------------------------------------
+  # JOB 1 – Lint (fast fail before heavy test job)
+  # ----------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff
+        run: ruff check . --select E,F,W --ignore E501
+
+  # ----------------------------------------------------------
+  # JOB 2 – Unit Tests
+  # ----------------------------------------------------------
+  test:
+    name: Unit Tests (pytest)
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Python ──────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      # ── Dependencies ────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov httpx
+
+      # ── Prepare / restore model ──────────────────────────
+      - name: Cache model files
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: model/
+          key: model-${{ hashFiles('prepare_model.py') }}
+
+      - name: Build model (if not cached)
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: python scripts/prepare_model.py --output-dir ./model --warmup 1 --runs 1
+
+      # ── Run tests ────────────────────────────────────────
+      - name: Run pytest with coverage
+        run: |
+          pytest tests/ \
+            --tb=short \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      # ── Upload coverage report ───────────────────────────
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # ----------------------------------------------------------
+  # JOB 3 – Build & Push Docker Image (only on main/master)
+  # ----------------------------------------------------------
+  build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore model cache
+        uses: actions/cache@v4
+        with:
+          path: model/
+          key: model-${{ hashFiles('prepare_model.py') }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false        # just build – push happens in deploy job
+          tags: nsfw-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ----------------------------------------------------------
+  # JOB 4 – Deploy to Hugging Face Spaces (CD)
+  #          Runs ONLY when all tests pass AND push is to main
+  # ----------------------------------------------------------
+  deploy:
+    name: Deploy → Hugging Face Spaces
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: |
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+      github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # full history required for git push
+
+      - name: Restore model cache
+        uses: actions/cache@v4
+        with:
+          path: model/
+          key: model-${{ hashFiles('prepare_model.py') }}
+
+      - name: Install huggingface_hub CLI
+        run: pip install huggingface_hub
+
+      - name: Configure Git identity
+        run: |
+          git config --global user.email "ci-bot@github.com"
+          git config --global user.name  "GitHub Actions"
+
+      - name: Push to Hugging Face Spaces via git
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # Clone the HF Space repo
+          git clone https://user:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE} hf_space
+
+          # Sync project files (exclude .git, venv, __pycache__)
+          rsync -av --exclude='.git' \
+                    --exclude='__pycache__' \
+                    --exclude='*.pyc' \
+                    --exclude='.env' \
+                    --exclude='hf_space' \
+                    . hf_space/
+
+          # Commit & push
+          cd hf_space
+          git add -A
+          git diff --cached --quiet || git commit -m "Deploy: ${{ github.sha }}"
+          git push
+
+      - name: Deployment summary
+        run: |
+          echo "✅  Deployed commit ${{ github.sha }} to https://huggingface.co/spaces/${HF_SPACE}"
