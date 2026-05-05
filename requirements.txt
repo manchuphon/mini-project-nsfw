@@ -1,7 +1,7 @@
 torch
 torchvision
 transformers
-optimum[exporters]
+optimum[onnxruntime]
 onnx
 onnxruntime
 pillow
