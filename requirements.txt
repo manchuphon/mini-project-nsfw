@@ -1,8 +1,8 @@
 torch
 torchvision
 transformers
+optimum[exporters]
 onnx
-onnxscript
 onnxruntime
 pillow
 numpy

@@ -66,32 +66,26 @@ print(f"  P95  latency : {pt_p95:.2f} ms")
 
 
 # ============================================================
-# PHASE 3: ONNX Export  — ใช้ legacy exporter (dynamo=False)
+# PHASE 3: ONNX Export — ใช้ optimum (Hugging Face official)
 # ============================================================
 print("\n" + "="*60)
-print("PHASE 3: Exporting to ONNX")
+print("PHASE 3: Exporting to ONNX (via optimum)")
 print("="*60)
 
-onnx_path = OUT / "model.onnx"
-dummy_inputs = processor(images=dummy_img, return_tensors="pt")
-dummy_tensor = dummy_inputs["pixel_values"]
+import shutil
+from optimum.onnxruntime import ORTModelForImageClassification
 
-# ── Legacy exporter: เสถียรกว่าและ quantize ได้ ──────────────
-with torch.no_grad():
-    torch.onnx.export(
-        pt_model,
-        (dummy_tensor,),
-        str(onnx_path),
-        export_params=True,
-        opset_version=14,          # 14 เสถียรที่สุดกับ ViT + quantize
-        do_constant_folding=True,
-        input_names=["pixel_values"],
-        output_names=["logits"],
-        dynamic_axes={
-            "pixel_values": {0: "batch_size"},
-            "logits":        {0: "batch_size"},
-        },
-    )
+onnx_dir = OUT / "onnx_tmp"
+ort_model = ORTModelForImageClassification.from_pretrained(
+    MODEL_ID,
+    export=True,
+    provider="CPUExecutionProvider",
+)
+ort_model.save_pretrained(str(onnx_dir))
+processor.save_pretrained(str(onnx_dir))
+
+onnx_path = OUT / "model.onnx"
+shutil.copy(onnx_dir / "model.onnx", onnx_path)
 
 onnx_size_mb = onnx_path.stat().st_size / 1e6
 print(f"ONNX model saved  ({onnx_size_mb:.1f} MB)")
@@ -100,6 +94,7 @@ import onnxruntime as ort
 
 sess_opts = ort.SessionOptions()
 sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+sess_opts.intra_op_num_threads = 2
 onnx_session = ort.InferenceSession(
     str(onnx_path),
     sess_options=sess_opts,
@@ -110,7 +105,8 @@ def onnx_infer(arr: np.ndarray):
     out = onnx_session.run(None, {"pixel_values": arr})
     return out[0].argmax(-1)[0]
 
-np_input = dummy_tensor.numpy()
+dummy_inputs = processor(images=dummy_img, return_tensors="pt")
+np_input = dummy_inputs["pixel_values"].numpy()
 
 for _ in range(args.warmup):
     onnx_infer(np_input)
@@ -131,7 +127,7 @@ print(f"  P95  latency : {onnx_p95:.2f} ms")
 # PHASE 4: Dynamic INT8 Quantization
 # ============================================================
 print("\n" + "="*60)
-print("PHASE 4: Dynamic INT8 Quantization…")
+print("PHASE 4: Dynamic INT8 Quantization...")
 print("="*60)
 
 from onnxruntime.quantization import QuantType, quantize_dynamic
@@ -181,9 +177,9 @@ print("="*60)
 header = f"{'Model':<20} {'Size (MB)':>10} {'Mean (ms)':>12} {'P95 (ms)':>12} {'Speedup':>10}"
 print(header)
 print("-" * len(header))
-print(f"{'PyTorch (baseline)':<20} {pt_size_mb:>10.1f} {pt_mean:>12.2f} {pt_p95:>12.2f} {'1.00×':>10}")
-print(f"{'ONNX':<20} {onnx_size_mb:>10.1f} {onnx_mean:>12.2f} {onnx_p95:>12.2f} {pt_mean/onnx_mean:>9.2f}×")
-print(f"{'ONNX + INT8 Quant':<20} {quant_size_mb:>10.1f} {quant_mean:>12.2f} {quant_p95:>12.2f} {pt_mean/quant_mean:>9.2f}×")
+print(f"{'PyTorch (baseline)':<20} {pt_size_mb:>10.1f} {pt_mean:>12.2f} {pt_p95:>12.2f} {'1.00x':>10}")
+print(f"{'ONNX':<20} {onnx_size_mb:>10.1f} {onnx_mean:>12.2f} {onnx_p95:>12.2f} {pt_mean/onnx_mean:>9.2f}x")
+print(f"{'ONNX + INT8 Quant':<20} {quant_size_mb:>10.1f} {quant_mean:>12.2f} {quant_p95:>12.2f} {pt_mean/quant_mean:>9.2f}x")
 
 results = {
     "pytorch":   {"size_mb": pt_size_mb,   "mean_ms": pt_mean,   "p95_ms": pt_p95},
