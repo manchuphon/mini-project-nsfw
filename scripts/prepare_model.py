@@ -1,7 +1,5 @@
 import argparse
-import io
 import json
-import os
 import time
 from pathlib import Path
 
@@ -20,7 +18,6 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 MODEL_ID = "Falconsai/nsfw_image_detection"
 
-# test image 
 def make_dummy_image() -> Image.Image:
     arr = np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8)
     return Image.fromarray(arr)
@@ -28,7 +25,9 @@ def make_dummy_image() -> Image.Image:
 dummy_img = make_dummy_image()
 
 
-# Baseline
+# ============================================================
+# PHASE 2: PyTorch Baseline
+# ============================================================
 print("\n" + "="*60)
 print("PHASE 2: Loading PyTorch model (baseline)")
 print("="*60)
@@ -40,11 +39,9 @@ processor = ViTImageProcessor.from_pretrained(MODEL_ID)
 pt_model  = AutoModelForImageClassification.from_pretrained(MODEL_ID)
 pt_model.eval()
 
-# Save for later use
 pt_model.save_pretrained(str(OUT / "pytorch"))
 processor.save_pretrained(str(OUT / "pytorch"))
 pt_size_mb = sum(f.stat().st_size for f in (OUT / "pytorch").rglob("*") if f.is_file()) / 1e6
-
 print(f"PyTorch model saved  ({pt_size_mb:.1f} MB)")
 
 def pytorch_infer(img: Image.Image):
@@ -53,11 +50,9 @@ def pytorch_infer(img: Image.Image):
         logits = pt_model(**inputs).logits
     return logits.argmax(-1).item()
 
-# Warm-up
 for _ in range(args.warmup):
     pytorch_infer(dummy_img)
 
-# Benchmark
 pt_times = []
 for _ in range(args.runs):
     t0 = time.perf_counter()
@@ -70,7 +65,9 @@ print(f"  Mean latency : {pt_mean:.2f} ms")
 print(f"  P95  latency : {pt_p95:.2f} ms")
 
 
-# ONNX Export
+# ============================================================
+# PHASE 3: ONNX Export  — ใช้ legacy exporter (dynamo=False)
+# ============================================================
 print("\n" + "="*60)
 print("PHASE 3: Exporting to ONNX")
 print("="*60)
@@ -79,15 +76,22 @@ onnx_path = OUT / "model.onnx"
 dummy_inputs = processor(images=dummy_img, return_tensors="pt")
 dummy_tensor = dummy_inputs["pixel_values"]
 
-torch.onnx.export(
-    pt_model,
-    (dummy_tensor,),
-    str(onnx_path),
-    input_names=["pixel_values"],
-    output_names=["logits"],
-    dynamic_axes={"pixel_values": {0: "batch_size"}, "logits": {0: "batch_size"}},
-    opset_version=17,
-)
+# ── Legacy exporter: เสถียรกว่าและ quantize ได้ ──────────────
+with torch.no_grad():
+    torch.onnx.export(
+        pt_model,
+        (dummy_tensor,),
+        str(onnx_path),
+        export_params=True,
+        opset_version=14,          # 14 เสถียรที่สุดกับ ViT + quantize
+        do_constant_folding=True,
+        input_names=["pixel_values"],
+        output_names=["logits"],
+        dynamic_axes={
+            "pixel_values": {0: "batch_size"},
+            "logits":        {0: "batch_size"},
+        },
+    )
 
 onnx_size_mb = onnx_path.stat().st_size / 1e6
 print(f"ONNX model saved  ({onnx_size_mb:.1f} MB)")
@@ -96,14 +100,16 @@ import onnxruntime as ort
 
 sess_opts = ort.SessionOptions()
 sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-onnx_session = ort.InferenceSession(str(onnx_path), sess_options=sess_opts,
-                                    providers=["CPUExecutionProvider"])
+onnx_session = ort.InferenceSession(
+    str(onnx_path),
+    sess_options=sess_opts,
+    providers=["CPUExecutionProvider"],
+)
 
 def onnx_infer(arr: np.ndarray):
     out = onnx_session.run(None, {"pixel_values": arr})
     return out[0].argmax(-1)[0]
 
-# Prepare numpy input
 np_input = dummy_tensor.numpy()
 
 for _ in range(args.warmup):
@@ -121,7 +127,9 @@ print(f"  Mean latency : {onnx_mean:.2f} ms")
 print(f"  P95  latency : {onnx_p95:.2f} ms")
 
 
-# Dynamic INT8 Quantization
+# ============================================================
+# PHASE 4: Dynamic INT8 Quantization
+# ============================================================
 print("\n" + "="*60)
 print("PHASE 4: Dynamic INT8 Quantization…")
 print("="*60)
@@ -138,8 +146,11 @@ quantize_dynamic(
 quant_size_mb = quant_path.stat().st_size / 1e6
 print(f"Quantized model saved  ({quant_size_mb:.1f} MB)")
 
-quant_session = ort.InferenceSession(str(quant_path), sess_options=sess_opts,
-                                     providers=["CPUExecutionProvider"])
+quant_session = ort.InferenceSession(
+    str(quant_path),
+    sess_options=sess_opts,
+    providers=["CPUExecutionProvider"],
+)
 
 def quant_infer(arr: np.ndarray):
     out = quant_session.run(None, {"pixel_values": arr})
@@ -160,7 +171,9 @@ print(f"  Mean latency : {quant_mean:.2f} ms")
 print(f"  P95  latency : {quant_p95:.2f} ms")
 
 
-# Comparison Table
+# ============================================================
+# PHASE 5: Benchmark Summary
+# ============================================================
 print("\n" + "="*60)
 print("PHASE 5: Benchmark Summary")
 print("="*60)
@@ -172,11 +185,10 @@ print(f"{'PyTorch (baseline)':<20} {pt_size_mb:>10.1f} {pt_mean:>12.2f} {pt_p95:
 print(f"{'ONNX':<20} {onnx_size_mb:>10.1f} {onnx_mean:>12.2f} {onnx_p95:>12.2f} {pt_mean/onnx_mean:>9.2f}×")
 print(f"{'ONNX + INT8 Quant':<20} {quant_size_mb:>10.1f} {quant_mean:>12.2f} {quant_p95:>12.2f} {pt_mean/quant_mean:>9.2f}×")
 
-# Save as JSON for reports
 results = {
     "pytorch":   {"size_mb": pt_size_mb,   "mean_ms": pt_mean,   "p95_ms": pt_p95},
     "onnx":      {"size_mb": onnx_size_mb,  "mean_ms": onnx_mean, "p95_ms": onnx_p95},
-    "quantized": {"size_mb": quant_size_mb, "mean_ms": quant_mean,"p95_ms": quant_p95},
+    "quantized": {"size_mb": quant_size_mb, "mean_ms": quant_mean, "p95_ms": quant_p95},
 }
 with open(OUT / "benchmark.json", "w") as f:
     json.dump(results, f, indent=2)
