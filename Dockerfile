@@ -1,4 +1,4 @@
-# ── Stage 1: Build dependencies ─────────────────────────────
+# ── Stage 1: Install all dependencies ───────────────────────
 FROM python:3.11-slim AS builder
 WORKDIR /build
 
@@ -13,13 +13,11 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 FROM python:3.11-slim AS model-builder
 WORKDIR /build
 
-# Install only what's needed to run prepare_model.py
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Reuse installed packages from Stage 1
+COPY --from=builder /install /usr/local
 
 COPY scripts/prepare_model.py ./scripts/prepare_model.py
 
-# Download model from HuggingFace and build ONNX + quantized
 RUN python scripts/prepare_model.py \
       --output-dir ./model \
       --warmup 1 \
@@ -31,13 +29,8 @@ FROM python:3.11-slim AS runtime
 RUN useradd -m -u 1000 appuser
 WORKDIR /app
 
-# Copy installed packages from builder
 COPY --from=builder /install /usr/local
-
-# Copy app code
 COPY app/ ./app/
-
-# Copy pre-built model files from model-builder stage
 COPY --from=model-builder /build/model/ ./model/
 
 ENV MODEL_BACKEND=quantized \
